@@ -86,6 +86,7 @@ from .const import (
     CONF_MQTT_STATUS_INTERVAL,
     CONF_PASSWORD,
     CONF_PROBE_POLL_INTERVAL,
+    CONF_SEGMENT_MODE_BY_DEVICE,
     CONF_WATER_DETECTOR_POLL_INTERVAL,
     DEFAULT_API_TEMPERATURE_UNIT,
     DEFAULT_CONFIRM_COMMANDS,
@@ -95,6 +96,7 @@ from .const import (
     MQTT_COLOR_SKUS,
     DEFAULT_MQTT_STATUS_INTERVAL,
     DEFAULT_PROBE_POLL_INTERVAL,
+    DEFAULT_SEGMENT_MODE,
     DEFAULT_WATER_DETECTOR_POLL_INTERVAL,
     DEVICE_REDISCOVERY_INTERVAL,
     DOMAIN,
@@ -141,6 +143,7 @@ from .const import (
     PTREAL_MAIN_PANEL_BIT,
     PTREAL_RING_MASK,
     PTREAL_SEGMENT_SKUS,
+    SEGMENT_MODE_DISABLED,
     PTREAL_ZONE_MAX_KELVIN,
     PTREAL_ZONE_MIN_KELVIN,
     RECENT_COMMAND_WINDOW_SECONDS,
@@ -184,11 +187,13 @@ from .models.commands import (
 from .api.ble_packet import (
     LIGHT_ZONE_MAIN,
     LIGHT_ZONE_RING,
+    SEGMENTS_PER_READ_PAGE,
     build_light_zone_ptreal,
     build_packet,
     build_segment_brightness_ptreal,
     build_segment_color_ptreal,
     build_segment_color_temp_ptreal,
+    build_segment_read_packet,
     calculate_checksum,
     encode_packet_base64,
     music_v3_effect_code,
@@ -255,6 +260,13 @@ STARTUP_STEP_TIMEOUT = 30
 # with a small gap so a "scene" that hits every segment doesn't drop
 # commands with empty JSON responses (issue #53).
 SEGMENT_COMMAND_PACING_SECONDS = 0.12
+
+# A status report schedules a segment colour read (``aa a5`` pages) this long
+# afterwards, at most once per SEGMENT_READ_MIN_INTERVAL per device: the five-
+# minute status sweep and the push a strip sends when the Govee app changes it
+# both arrive as status reports.
+SEGMENT_READ_DELAY_SECONDS = 2.0
+SEGMENT_READ_MIN_INTERVAL = 30.0
 
 # Tolerance (device-native brightness units) for confirming a LAN brightness
 # write by reading the device back. A LAN devStatus reports brightness on the
@@ -481,6 +493,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         # lock keeps one in flight at a time, paced by
         # SEGMENT_COMMAND_PACING_SECONDS to stay under the 100/min cap.
         self._segment_locks: dict[str, asyncio.Lock] = {}
+        # Pending segment colour reads ({device_id: cancel}) and when each
+        # device's last read went out (monotonic). See _schedule_segment_read.
+        self._segment_read_unsubs: dict[str, Callable[[], None]] = {}
+        self._segment_read_last: dict[str, float] = {}
 
         # Scene cache manager
         self._scene_cache = SceneCacheManager(api_client)
@@ -3896,6 +3912,13 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         # replaces HA's optimistic DreamView flag (issue #213).
         if device is not None and device.sku.upper() in DREAMVIEW_STATE_FROM_FRAMES_SKUS and device.supports_dreamview:
             state.update_dreamview_from_frames(self._op_frames_from(state_data))
+        # RGBIC strips report their real segment colours only in answer to an
+        # ``aa a5`` read; a status report (it carries ``onOff``, a ptReal
+        # answer does not) schedules that read.
+        if device is not None and self._reads_segments(device):
+            state.update_segments_from_frames(self._op_frames_from(state_data), device.segment_count)
+            if "onOff" in state_data:
+                self._schedule_segment_read(device_id)
         if device is not None and device.supports_pump_state:
             frames = self._op_frames_from(state_data)
             state.update_pump_state_from_frames(frames)
@@ -3947,6 +3970,70 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             state.presence,
             state_data.get("triSta"),
         )
+
+    def _reads_segments(self, device: GoveeDevice) -> bool:
+        """Whether the device's segment colours are read back (see _schedule_segment_read).
+
+        Only a single RGBIC device with segment entities: a group has no
+        topic of its own, and with segments disabled nothing shows the colours.
+        The ceiling fixtures in PTREAL_SEGMENT_SKUS address their ring and
+        panel with their own ptReal frames, and the read is unverified there.
+        """
+        if device.is_group or not device.supports_segments or device.segment_count <= 0:
+            return False
+        if device.sku.upper() in PTREAL_SEGMENT_SKUS:
+            return False
+        modes = self._config_entry.options.get(CONF_SEGMENT_MODE_BY_DEVICE, {})
+        return bool(modes.get(device.device_id, DEFAULT_SEGMENT_MODE) != SEGMENT_MODE_DISABLED)
+
+    @callback
+    def _schedule_segment_read(self, device_id: str) -> None:
+        """Read the device's segment colours shortly, unless a read is pending or recent."""
+        if device_id in self._segment_read_unsubs:
+            return
+        last = self._segment_read_last.get(device_id)
+        if last is not None and time.monotonic() - last < SEGMENT_READ_MIN_INTERVAL:
+            return
+
+        async def _read(_now: Any) -> None:
+            self._segment_read_unsubs.pop(device_id, None)
+            await self.async_read_segments(device_id)
+
+        self._segment_read_unsubs[device_id] = async_call_later(self.hass, SEGMENT_READ_DELAY_SECONDS, _read)
+
+    async def async_read_segments(self, device_id: str) -> bool:
+        """Ask an RGBIC device for its segment colours over the AWS IoT passthrough.
+
+        Sends one ``aa a5 <page>`` query per four segments. The device answers
+        each on the account topic, and the MQTT handler applies the answers
+        through ``GoveeDeviceState.update_segments_from_frames``. Govee's
+        Developer API never returns segment colours, so without this the
+        segment entities only know what Home Assistant last sent. The queries
+        share the segment command lock, so they never interleave with a
+        segment write.
+
+        Args:
+            device_id: Device identifier.
+
+        Returns:
+            True if every page query was published.
+        """
+        device = self._devices.get(device_id)
+        if device is None or not self._reads_segments(device) or not self._ble_manager.available:
+            return False
+        self._segment_read_last[device_id] = time.monotonic()
+        pages = -(-device.segment_count // SEGMENTS_PER_READ_PAGE)
+        lock = self._segment_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            for page in range(1, pages + 1):
+                packet = build_segment_read_packet(page)
+                if not await self._ble_manager.async_send_ble_packet(
+                    device_id, device.sku, encode_packet_base64(packet)
+                ):
+                    _LOGGER.debug("Segment read for %s stopped at page %d", device_id, page)
+                    return False
+                await asyncio.sleep(SEGMENT_COMMAND_PACING_SECONDS)
+        return True
 
     @staticmethod
     def _op_frames_from(state_data: dict[str, Any]) -> list[bytes]:
@@ -6719,6 +6806,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if self._status_poll_unsub:
             self._status_poll_unsub()
             self._status_poll_unsub = None
+        for cancel in self._segment_read_unsubs.values():
+            cancel()
+        self._segment_read_unsubs.clear()
 
         # Disconnect all BLE devices
         for ble_device in self._ble_devices.values():
