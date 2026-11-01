@@ -696,6 +696,47 @@ class GoveeDeviceState:
             return True
         return False
 
+    def update_segments_from_frames(self, frames: Iterable[bytes], segment_count: int) -> bool:
+        """Apply the strip's ``aa a5 <page>`` segment colour reports.
+
+        An RGBIC strip answers the ``aa a5 <page>`` ptReal query (see
+        ``build_segment_read_packet``) with ``aa a5 <page> {LL RR GG BB}x4``:
+        four segments per page, page 1 holding segments 0-3. LL is the
+        segment's brightness in percent. The Developer API returns ``""`` for
+        ``segmentedColorRgb``, so this is the only real per-segment state.
+        Slots past ``segment_count`` are padding and are ignored. Only a full
+        20-byte frame with a valid XOR checksum counts.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+            segment_count: Number of segments the device has.
+
+        Returns:
+            True if a reported segment changed.
+        """
+        reported = {segment.index: segment for segment in self.segments}
+        changed = False
+        for raw in frames:
+            if len(raw) != 20 or raw[0] != 0xAA or raw[1] != 0xA5 or raw[2] == 0:
+                continue
+            checksum = 0
+            for byte in raw[:19]:
+                checksum ^= byte
+            if checksum != raw[19]:
+                continue
+            for slot in range(4):
+                index = (raw[2] - 1) * 4 + slot
+                if index >= segment_count:
+                    break
+                level, red, green, blue = raw[3 + slot * 4 : 7 + slot * 4]
+                segment = SegmentState(index=index, color=RGBColor(r=red, g=green, b=blue), brightness=level)
+                if reported.get(index) != segment:
+                    reported[index] = segment
+                    changed = True
+        if changed:
+            self.segments = [reported[index] for index in sorted(reported)]
+        return changed
+
     def update_dreamview_from_frames(self, frames: Iterable[bytes]) -> bool:
         """Apply the light's own ``aa 05 <mode>`` mode report to DreamView (H66A0, #213).
 

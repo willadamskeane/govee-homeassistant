@@ -26,7 +26,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from ..const import SUFFIX_SEGMENT
 from ..coordinator import GoveeCoordinator
 from ..entity import GoveeEntity
-from ..models import GoveeDevice, RGBColor, SegmentColorCommand
+from ..models import GoveeDevice, RGBColor, SegmentColorCommand, SegmentState
 from .grouped_segment import segments_optimistic_signal
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,9 +40,10 @@ class GoveeSegmentEntity(GoveeEntity, LightEntity, RestoreEntity):
     Represents a single segment of an RGBIC LED strip.
 
     API Limitation: Govee API returns empty strings for segment colors.
-    We use purely optimistic/local state that persists via RestoreEntity.
-    This entity intentionally does NOT subscribe to coordinator updates
-    to prevent API responses from overwriting local state.
+    State is optimistic and persists via RestoreEntity, except that the
+    strip's own answer to the ``aa a5`` segment read (the coordinator's
+    ``async_read_segments``) replaces it whenever that answer changes. An
+    unchanged answer never overwrites a newer local write.
     """
 
     _attr_translation_key = "govee_segment"
@@ -78,6 +79,9 @@ class GoveeSegmentEntity(GoveeEntity, LightEntity, RestoreEntity):
         self._is_on = True
         self._brightness = 255
         self._rgb_color: tuple[int, int, int] = (255, 255, 255)
+        # The last segment report applied, so an unchanged report is not
+        # re-applied over a newer local write.
+        self._applied_report: SegmentState | None = None
 
     @property
     def is_on(self) -> bool:
@@ -194,6 +198,26 @@ class GoveeSegmentEntity(GoveeEntity, LightEntity, RestoreEntity):
                 self._handle_group_update,
             )
         )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Take the strip's reported colour for this segment when it changed.
+
+        A segment reporting 0 % brightness or black is off; its last colour is
+        kept so turning it on again restores that colour.
+        """
+        state = self.coordinator.get_state(self._device_id)
+        report = None
+        if state is not None:
+            report = next((seg for seg in state.segments if seg.index == self._segment_index), None)
+        if report is not None and report != self._applied_report:
+            self._applied_report = report
+            color = report.color.as_tuple
+            self._is_on = report.brightness > 0 and color != (0, 0, 0)
+            if self._is_on:
+                self._rgb_color = color
+                self._brightness = max(1, round(min(report.brightness, 100) * 255 / 100))
+        super()._handle_coordinator_update()
 
     @callback
     def _handle_group_update(

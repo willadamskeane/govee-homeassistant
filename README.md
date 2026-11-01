@@ -203,7 +203,7 @@ For RGBIC strips/bars you can control individual lighting segments. After saving
 - **Both** — the grouped entity alongside the individual ones, so you can paint segments and still switch them together.
 - **Disabled** — no segment entities.
 
-Segment colors aren't reliably returned by the API, so segment entities keep optimistic state and restore it across restarts.
+Segment colors aren't returned by the API. With account login, the integration asks the strip for them over AWS IoT (an `aa a5` read, a few seconds after each status report and at most every 30 seconds), so segment entities follow colors set in the Govee app too; without it they keep optimistic state and restore it across restarts. Animated scenes show whichever frame was current when read.
 
 **H8057 fourth segment:** the Platform API advertises brightness indices 0–3 but RGB indices 0–2;
 RGB writes to index 3 are rejected with application-level 400 "Parameter value out of range."
@@ -289,7 +289,7 @@ The H717A and H7170 keep their power switch and temperature sensor; their frames
 
 - Everything runs through Govee's cloud unless a device supports the LAN API or is within Bluetooth range; there is no fully local mode.
 - The developer API allows 100 requests per minute and 10,000 per day per key. Every state poll costs one request per device, so large installs should raise the polling interval and let MQTT push carry the updates.
-- Govee does not report the active scene, per-segment colors, or several appliance settings, so those entities keep the last value the integration sent (optimistic state) and restore it across restarts.
+- Govee does not report the active scene or several appliance settings (per-segment colors are read back over AWS IoT when account login is configured), so those entities keep the last value the integration sent (optimistic state) and restore it across restarts.
 - Thermometer readings refresh on Govee's schedule, typically every 10 minutes for Wi-Fi sensors and up to an hour for Bluetooth sensors behind a gateway; see [Thermometers & sensors](#thermometers--sensors).
 - Account login, real-time MQTT, LAN control, and Bluetooth passthrough use undocumented interfaces that can stop working when Govee changes them. The developer API path is the stable one.
 - Bluetooth-only devices are not supported here; use Home Assistant's built-in `govee_ble` integration for those.

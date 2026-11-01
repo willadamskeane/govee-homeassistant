@@ -193,6 +193,27 @@ LIGHT_ZONE_MAIN = 0x00
 LIGHT_ZONE_RING = 0x01
 
 
+# Segment colour read: ``aa a5 <page>`` asks an RGBIC strip for four segments'
+# brightness and colour; the reply is ``aa a5 <page> {LL RR GG BB}x4``
+# (``GoveeDeviceState.update_segments_from_frames``). Verified over the AWS IoT
+# passthrough on the H706A, and over BLE on the H6061 and H6088
+# (github.com/mpalczew/govee-ble-segments).
+SEGMENT_READ_COMMAND = 0xA5
+SEGMENTS_PER_READ_PAGE = 4
+
+
+def build_segment_read_packet(page: int) -> bytes:
+    """Build the ``aa a5 <page>`` query for one page of segment colours.
+
+    Args:
+        page: 1-based page; page n covers segments 4(n-1) to 4n-1.
+
+    Returns:
+        20-byte BLE packet.
+    """
+    return build_packet([0xAA, SEGMENT_READ_COMMAND, page & 0xFF])
+
+
 def build_segment_color_ptreal(rgb: RGBColor, mask: int) -> list[int]:
     """Build the masked ptReal segment colour frame data (H1232, issue #223).
 
